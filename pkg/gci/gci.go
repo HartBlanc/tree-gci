@@ -142,7 +142,7 @@ func LoadFormat(in []byte, path string, cfg config.Config) (src, dist []byte, er
 		if errors.Is(err, parse.NoImportError{}) {
 			return src, src, nil
 		}
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("parsing: %w", err)
 	}
 
 	// do not do format if only one import
@@ -152,7 +152,7 @@ func LoadFormat(in []byte, path string, cfg config.Config) (src, dist []byte, er
 
 	result, err := format.Format(imports, &cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("formatting: %w", err)
 	}
 
 	firstWithIndex := true
@@ -198,26 +198,31 @@ func LoadFormat(in []byte, path string, cfg config.Config) (src, dist []byte, er
 	}
 
 	var totalLen int
-	slices := [][]byte{head, body, tail}
+	slices := [][]byte{head, body}
 	for _, s := range slices {
 		totalLen += len(s)
 	}
+
 	dist = make([]byte, totalLen)
 	var i int
 	for _, s := range slices {
 		i += copy(dist[i:], s)
 	}
 
+	log.L().Debug(fmt.Sprintf("raw:\n%s", dist))
+
+	// run gofmt on the imports
+	dist, err = goFormat.Source(dist)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gofmt: %w", err)
+	}
+
+	// add the tail back in after formatting
+
 	// remove ^M(\r\n) from Win to Unix
 	dist = bytes.ReplaceAll(dist, []byte{utils.WinLinebreak}, []byte{utils.Linebreak})
 
-	log.L().Debug(fmt.Sprintf("raw:\n%s", dist))
-	dist, err = goFormat.Source(dist)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return src, dist, nil
+	return src, append(dist, tail...), nil
 }
 
 func AddIndent(in *[]byte, first *bool) {

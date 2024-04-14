@@ -1,11 +1,17 @@
 package parse
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"sort"
 	"strings"
+
+	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/golang"
 )
 
 const C = "\"C\""
@@ -71,6 +77,123 @@ func getImports(imp *ast.ImportSpec) (start, end int, name string) {
 }
 
 func ParseFile(src []byte, filename string) (ImportList, int, int, int, int, error) {
+	parser := sitter.NewParser()
+	parser.SetLanguage(golang.GetLanguage())
+	tree, err := parser.ParseCtx(context.Background(), nil, src)
+	if err != nil {
+		return nil, 0, 0, 0, 0, fmt.Errorf("ParseCtx: %w", err)
+	}
+
+	query, err := sitter.NewQuery([]byte("(import_declaration) @imports"), golang.GetLanguage())
+	if err != nil {
+		return nil, 0, 0, 0, 0, err
+	}
+	declarationQueryCursor := sitter.NewQueryCursor()
+	declarationQueryCursor.Exec(query, tree.RootNode())
+
+	var (
+		// headEnd means the start of import block
+		headEnd int
+		// tailStart means the end + 1 of import block
+		tailStart int
+		// cStart means the start of C import block
+		cStart int
+		// cEnd means the end of C import block
+		cEnd int
+		data ImportList
+	)
+
+	query, err = sitter.NewQuery([]byte("(import_spec) @import"), golang.GetLanguage())
+	if err != nil {
+		return nil, 0, 0, 0, 0, fmt.Errorf("building query to get 'import_spec's in 'import_declaration's: %w", err)
+	}
+
+	var declarationIndex int
+	for declarationMatch, ok := declarationQueryCursor.NextMatch(); ok; declarationMatch, ok = declarationQueryCursor.NextMatch() {
+		importDeclaration := declarationMatch.Captures[0].Node
+		if importDeclaration.HasError() {
+			return nil, 0, 0, 0, 0, errors.New("import_declaration contains errors")
+		}
+
+		if headEnd == 0 {
+			headEnd = int(importDeclaration.StartByte())
+		}
+		tailStart = int(importDeclaration.EndByte() + 1)
+		if tailStart > len(src) {
+			tailStart = len(src)
+		}
+
+
+		specQueryCursor := sitter.NewQueryCursor()
+		specQueryCursor.Exec(query, importDeclaration)
+
+		var prevSpec *sitter.Node
+
+		for specMatch, ok := specQueryCursor.NextMatch(); ok; specMatch, ok = specQueryCursor.NextMatch() {
+			importSpec := specMatch.Captures[0].Node
+
+			start := importSpec.StartByte()
+			commentSiblingNode := importSpec
+			if parent := importSpec.Parent(); parent.Type() == "import_declaration" {
+				commentSiblingNode = parent
+			}
+			for prevSibling := commentSiblingNode.PrevSibling(); prevSibling != nil && prevSibling.Type() == "comment" && (prevSpec == nil || prevSpec.StartPoint().Row != prevSibling.StartPoint().Row); prevSibling = prevSibling.PrevSibling() {
+				start = prevSibling.StartByte()
+			}
+
+			end := importSpec.EndByte() + 1
+			if nextSibling := importSpec.NextSibling(); nextSibling != nil && nextSibling.Type() == "comment" && (nextSibling.StartPoint().Row == importSpec.StartPoint().Row) {
+				end = nextSibling.EndByte() + 1
+			}
+
+			var name string
+			if nameNode := importSpec.ChildByFieldName("name"); nameNode != nil {
+				name = nameNode.Content(src)
+			}
+
+			path := strings.Trim(importSpec.ChildByFieldName("path").Content(src), `"`)
+
+			if path == "C" {
+				cStart = int(start)
+				cEnd = int(end)
+
+				// lines like 'import "C"' with no doc comment
+				if commentSiblingNode.Type() == "import_declaration" && start == importSpec.StartByte() {
+					cStart = int(commentSiblingNode.StartByte())
+				}
+
+				if declarationIndex == 0 {
+					headEnd = cStart
+				}
+			} else {
+				data = append(
+					data,
+					&GciImports{
+						Start: int(start),
+						End:   int(end),
+						Name:  strings.TrimSpace(name),
+						Path:  path,
+					},
+				)
+			}
+
+			prevSpec = importSpec
+			declarationIndex++
+		}
+	}
+
+	sort.Sort(data)
+	return data, headEnd, tailStart, cStart, cEnd, nil
+}
+
+func printData(data ImportList) {
+	fmt.Printf("printing %d records\n", len(data))
+	for _, d := range data {
+		fmt.Printf("Start: %d End: %d Name: %s Path: %s\n", d.Start, d.End, d.Name, d.Path)
+	}
+}
+
+func ParseFiles(src []byte, filename string) (ImportList, int, int, int, int, error) {
 	fileSet := token.NewFileSet()
 	f, err := parser.ParseFile(fileSet, filename, src, parser.ParseComments)
 	if err != nil {
@@ -94,11 +217,9 @@ func ParseFile(src []byte, filename string) (ImportList, int, int, int, int, err
 	)
 
 	for index, decl := range f.Decls {
-		switch decl.(type) {
+		switch genDecl := decl.(type) {
 		// skip BadDecl and FuncDecl
 		case *ast.GenDecl:
-			genDecl := decl.(*ast.GenDecl)
-
 			if genDecl.Tok == token.IMPORT {
 				// there are two cases, both end with linebreak:
 				// 1.
